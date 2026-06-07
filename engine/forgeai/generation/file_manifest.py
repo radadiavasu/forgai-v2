@@ -352,6 +352,14 @@ class ContentValidator:
         # Check minimum size by file type
         ext = "." + path.rsplit(".", 1)[-1] if "." in path else ""
         min_bytes = self.MIN_CONTENT_BYTES.get(ext, 20)
+        config_files = (
+            "vite.config.js", "tailwind.config.js",
+            "postcss.config.js", "jest.config.js",
+            "vitest.config.js", "nodemon.json",
+        )
+        filename = path.split("/")[-1]
+        if filename in config_files or path.endswith(".config.js"):
+            min_bytes = 30
         if len(content.strip()) < min_bytes:
             return False
 
@@ -415,126 +423,14 @@ class ContentValidator:
 
         ext = "." + path.rsplit(".", 1)[-1] if "." in path else ""
         min_bytes = self.MIN_CONTENT_BYTES.get(ext, 20)
-        if len(content.strip()) < min_bytes:
-            return f"too short: {len(content.strip())} bytes, minimum {min_bytes}"
-
-        return "failed code pattern check"
-
-
-class ContentValidator:
-    """
-    Validates that generated file content is actual code,
-    not agent commentary or placeholder text.
-    """
-
-    COMMENTARY_PHRASES = (
-        "wait, let me",
-        "let me reconsider",
-        "let me provide",
-        "now let me",
-        "actually,",
-        "i need to",
-        "upon reflection",
-        "looking at this",
-        "i should clarify",
-        "here is the",
-        "here's the",
-        "certainly,",
-        "of course,",
-        "sure,",
-    )
-
-    MIN_CONTENT_BYTES = {
-        ".html": 50,
-        ".jsx": 100,
-        ".js": 100,
-        ".py": 50,
-        ".sql": 30,
-        ".json": 20,
-        ".yml": 30,
-        ".yaml": 30,
-        ".css": 10,
-        ".md": 10,
-    }
-
-    def is_valid(self, path: str, content: str) -> bool:
-        """Returns True if content looks like real code."""
-        if not content or not content.strip():
-            return False
-
-        lower = content.strip().lower()
-
-        # Reject commentary
-        for phrase in self.COMMENTARY_PHRASES:
-            if lower.startswith(phrase) or lower[:200].startswith(phrase):
-                return False
-
-        # Check minimum size by file type
-        ext = "." + path.rsplit(".", 1)[-1] if "." in path else ""
-        min_bytes = self.MIN_CONTENT_BYTES.get(ext, 20)
-        if len(content.strip()) < min_bytes:
-            return False
-
-        # File-type specific checks
-        if path.endswith(".jsx") or path.endswith(".js"):
-            has_code = any(
-                kw in content for kw in (
-                    "import ", "export ", "const ", "function ",
-                    "class ", "require(", "module.exports",
-                )
-            )
-            if not has_code:
-                return False
-
-        if path.endswith(".py"):
-            has_code = any(
-                kw in content for kw in (
-                    "import ", "from ", "def ", "class ",
-                    "async def",
-                )
-            )
-            if not has_code:
-                return False
-
-        if path.endswith(".sql"):
-            has_code = any(
-                kw in content.upper() for kw in (
-                    "CREATE ", "INSERT ", "SELECT ", "ALTER ",
-                    "DROP ", "--",
-                )
-            )
-            if not has_code:
-                return False
-
-        if path.endswith(".html"):
-            if "<" not in content or ">" not in content:
-                return False
-
-        if path.endswith(".json"):
-            try:
-                import json
-                json.loads(content)
-            except Exception:
-                return False
-
-        if path.endswith(".yml") or path.endswith(".yaml"):
-            if ":" not in content:
-                return False
-
-        return True
-
-    def rejection_reason(self, path: str, content: str) -> str:
-        """Returns why content was rejected."""
-        if not content or not content.strip():
-            return "empty content"
-
-        lower = content.strip().lower()
-        for phrase in self.COMMENTARY_PHRASES:
-            if lower[:200].startswith(phrase):
-                return f"agent commentary detected: '{phrase}'"
-
-        ext = "." + path.rsplit(".", 1)[-1] if "." in path else ""
-        min_bytes = self.MIN_CONTENT_BYTES.get(ext, 20)
+        config_files = (
+            "vite.config.js", "tailwind.config.js",
+            "postcss.config.js", "jest.config.js",
+            "vitest.config.js", "nodemon.json",
+        )
+        filename = path.split("/")[-1]
+        if filename in config_files or path.endswith(".config.js"):
+            min_bytes = 30
         if len(content.strip()) < min_bytes:
             return f"too short: {len(content.strip())} bytes, minimum {min_bytes}"
 

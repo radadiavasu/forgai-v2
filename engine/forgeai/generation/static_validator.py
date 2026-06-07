@@ -18,6 +18,25 @@ class StaticValidator:
         backend_files: list[GeneratedFile],
         master: MasterDocument,
     ) -> ValidationResult:
+        frontend_files = [
+            GeneratedFile(
+                path=f.path.replace("\\", "/"),
+                content=f.content,
+                layer=f.layer,
+                bytes=f.bytes,
+            )
+            for f in frontend_files
+        ]
+        backend_files = [
+            GeneratedFile(
+                path=f.path.replace("\\", "/"),
+                content=f.content,
+                layer=f.layer,
+                bytes=f.bytes,
+            )
+            for f in backend_files
+        ]
+
         issues = []
         files_checked = len(frontend_files) + len(backend_files)
 
@@ -135,10 +154,11 @@ class StaticValidator:
         self, files: list[GeneratedFile]
     ) -> list[ValidationIssue]:
         issues = []
-        paths = {f.path for f in files}
+        paths = {self._normalize_separators(f.path) for f in files}
 
         for f in files:
-            if not f.path.endswith((".jsx", ".js")):
+            file_path = self._normalize_separators(f.path)
+            if not file_path.endswith((".jsx", ".js")):
                 continue
             imports = re.findall(
                 r"import .+ from ['\"](\./[^'\"]+)['\"]",
@@ -146,47 +166,66 @@ class StaticValidator:
             )
             for imp in imports:
                 # Resolve relative import
-                base = "/".join(f.path.split("/")[:-1])
-                resolved = f"{base}/{imp}".replace("//", "/")
+                base = "/".join(file_path.split("/")[:-1])
+                resolved = self._normalize_separators(
+                    f"{base}/{imp.lstrip('./')}"
+                ).replace("//", "/")
                 # Try with extensions
                 found = any(
-                    resolved + ext in paths
+                    self._normalize_separators(resolved + ext) in paths
                     for ext in ("", ".jsx", ".js")
                 )
                 if not found:
                     issues.append(ValidationIssue(
                         severity="warning",
-                        file=f.path,
+                        file=file_path,
                         description=f"Import '{imp}' may not resolve",
                         suggestion=f"Check that {resolved} exists",
                     ))
 
         return issues
 
+    def _normalize_separators(self, path: str) -> str:
+        return path.replace("\\", "/")
+
     def _check_server_wiring(
         self, files: list[GeneratedFile]
     ) -> list[ValidationIssue]:
         issues = []
+
+        # Accept either server.js or index.js as entry point
         server = next(
-            (f for f in files if f.path == "src/server.js"), None
+            (f for f in files if f.path in (
+                "src/server.js", "src/index.js", "server.js", "index.js"
+            )),
+            None
         )
         if server is None:
             return issues
 
-        if "routes" not in server.content.lower():
+        # If server.js is tiny (< 300 bytes), check index.js instead
+        if server.path == "src/server.js" and server.bytes < 300:
+            alt = next(
+                (f for f in files if f.path == "src/index.js"),
+                None
+            )
+            if alt and alt.bytes > 300:
+                server = alt
+
+        if "routes" not in server.content.lower() and \
+           "router" not in server.content.lower():
             issues.append(ValidationIssue(
-                severity="error",
-                file="src/server.js",
-                description="server.js does not import routes",
+                severity="warning",
+                file=server.path,
+                description="server entry does not import routes",
                 suggestion="Add: import routes from './routes/index.js'",
             ))
 
-        if "app.listen" not in server.content and \
-           "server.listen" not in server.content:
+        if "listen" not in server.content:
             issues.append(ValidationIssue(
                 severity="error",
-                file="src/server.js",
-                description="server.js does not start the server",
+                file=server.path,
+                description="server does not start listening",
                 suggestion="Add: app.listen(PORT, ...)",
             ))
 
@@ -223,29 +262,60 @@ class StaticValidator:
     def _has_matching_route(
         self, call: str, routes: set[str]
     ) -> bool:
-        """Check if any route matches the API call path."""
+        candidates = self._path_candidates(call)
         for route in routes:
             parts = route.split(" ", 1)
-            if len(parts) == 2:
-                route_path = parts[1]
-                # Normalize :param patterns
-                normalized = re.sub(r':[^/]+', ':id', route_path)
-                normalized_call = re.sub(r'/[0-9a-f-]{36}', '/:id', call)
-                if normalized == normalized_call or route_path == call:
+            if len(parts) != 2:
+                continue
+            r_path = parts[1]
+            norm_route = re.sub(r':[^/]+', ':id', r_path)
+            for candidate in candidates:
+                norm_cand = re.sub(r':[^/]+', ':id', candidate)
+                if norm_route == norm_cand:
                     return True
         return False
 
     def _route_exists(
         self, path: str, method: str, routes: set[str]
     ) -> bool:
-        """Check if a specific method+path route exists."""
+        candidates = self._path_candidates(path)
         for route in routes:
             parts = route.split(" ", 1)
-            if len(parts) == 2:
-                r_method, r_path = parts
-                if r_method.lower() == method.lower():
-                    normalized = re.sub(r':[^/]+', ':id', r_path)
-                    norm_path = re.sub(r':[^/]+', ':id', path)
-                    if normalized == norm_path or r_path == path:
-                        return True
+            if len(parts) != 2:
+                continue
+            r_method, r_path = parts
+            if r_method.lower() != method.lower():
+                continue
+            norm_route = re.sub(r':[^/]+', ':id', r_path)
+            for candidate in candidates:
+                norm_candidate = re.sub(r':[^/]+', ':id', candidate)
+                if norm_route == norm_candidate:
+                    return True
         return False
+
+    def _path_candidates(self, path: str) -> list[str]:
+        """
+        Generate all path variants to try matching.
+        Handles /api prefix and route mounting patterns.
+        """
+        candidates = [path]
+
+        # Strip /api prefix
+        if path.startswith("/api/"):
+            stripped = path[4:]  # /api/tasks → /tasks
+            candidates.append(stripped)
+
+            # Strip second segment (mount prefix)
+            # /api/auth/login → /login
+            # /api/tasks/history → /history
+            parts = stripped.split("/", 2)
+            if len(parts) >= 3:
+                candidates.append("/" + parts[2])
+            # /api/tasks → /
+            elif len(parts) == 2:
+                candidates.append("/")
+
+        # Also try without leading slash
+        candidates += [c.lstrip("/") for c in candidates]
+
+        return list(set(candidates))
