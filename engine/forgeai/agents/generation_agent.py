@@ -23,6 +23,16 @@ Rules:
 8. React Router Links for all navigation — no <a> tags
 9. Show loading and error states for all API calls
 10. index.html must be in project root, not src/
+11. Vite proxy target is ALWAYS http://localhost:3001
+12. API base URL: import.meta.env.VITE_API_URL ?? 'http://localhost:3001/api'
+13. Field names must exactly match the data models provided
+14. API client must unwrap { data: [] } responses
+    e.g. const tasks = response.data — not response directly
+15. Generate ONE package.json for frontend only
+    It must include: react, react-dom, react-router-dom,
+    vite, @vitejs/plugin-react, tailwindcss, postcss, autoprefixer
+16. Do NOT generate main.jsx AND index.jsx — use main.jsx only
+17. src/main.jsx is the ONLY entry point
 
 Output ONLY a JSON object. No explanation. No markdown.
 Format:
@@ -50,10 +60,18 @@ Rules:
 8. Use process.env.PORT and process.env.DATABASE_URL
 9. CORS must be configured before routes
 10. migrations/001_init.sql must create all tables from data models
-11. package.json must have start, dev, and test scripts
-12. docker-compose.yml must wire frontend + backend + database
-13. Dockerfile must be a multi-stage build
-14. Use ES modules (import/export) throughout
+11. Backend port is ALWAYS 3001. Use process.env.PORT || 3001
+12. All list endpoints return { data: [] } — never raw arrays
+13. All single item endpoints return { data: {} }
+14. Field names must exactly match the data models in the spec
+15. Dockerfile must use npm install not npm ci
+16. Generate ONE package.json for backend only
+    It must NOT include react, vite, or frontend dependencies
+17. CORS must allow http://localhost:3000
+18. Do NOT generate duplicate DB files — one src/db.js only
+19. Do NOT generate duplicate migration files — one only
+20. Add a README.md with exact run steps:
+    npm install, npm run dev, and docker compose up
 
 Output ONLY a JSON object. No explanation. No markdown.
 Format:
@@ -203,6 +221,23 @@ Database: use DATABASE_URL environment variable
 
 Generate every file listed above. Each file must be complete
 and production-ready."""
+
+        fields_text = "\n".join(
+            f"  {m.name}: " + ", ".join(
+                f.name for f in m.fields
+            )
+            for m in master.data_models
+        )
+        user_message += f"""
+
+EXACT FIELD NAMES — use these everywhere, no variations:
+{fields_text}
+
+These field names must be identical in:
+- PostgreSQL schema
+- API request/response JSON
+- Frontend state and forms
+"""
 
         raw_files = await self._call_with_retry(
             system_prompt=BACKEND_GENERATION_PROMPT,

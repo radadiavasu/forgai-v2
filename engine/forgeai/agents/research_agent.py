@@ -150,7 +150,7 @@ Tech Stack: {tech_stack.language}, {tech_stack.framework},
 {tech_stack.database}
 Output the JSON object as specified.""",
             model="claude-sonnet-4-6",
-            max_tokens=4000,
+            max_tokens=8000,
         )
 
         try:
@@ -158,7 +158,18 @@ Output the JSON object as specified.""",
             if raw.startswith("```"):
                 raw = raw.split("\n", 1)[1]
                 raw = raw.rsplit("```", 1)[0]
-            data = json.loads(raw)
+
+            # Try direct parse first
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                # Try to find the largest valid JSON object
+                import re
+                match = re.search(r'\{[\s\S]*\}', raw)
+                if match:
+                    data = json.loads(match.group(0))
+                else:
+                    raise ValueError("No JSON found in response")
 
             components = [
                 Component(**c) for c in data.get("components", [])

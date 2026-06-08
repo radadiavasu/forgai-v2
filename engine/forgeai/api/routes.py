@@ -76,6 +76,12 @@ async def send_message(
     return response
 
 
+@router.get("/projects/{project_id}/messages")
+async def get_messages(project_id: str):
+    messages = await db.get_messages(project_id)
+    return {"messages": messages}
+
+
 # ── Activity Stream ───────────────────────────────
 
 @router.get("/projects/{project_id}/stream")
