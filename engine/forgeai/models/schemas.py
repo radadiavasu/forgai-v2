@@ -15,6 +15,7 @@ class ConversationState(str, Enum):
     GENERATING_BACKEND = "GENERATING_BACKEND"
     COMPLETE = "COMPLETE"
     LIVE = "LIVE"
+    CANCELLED = "CANCELLED"
 
 
 # ── Message Classification ────────────────────────────
@@ -172,6 +173,12 @@ class SendMessageResponse(BaseModel):
     message: str
     state: ConversationState
     project: Optional[Project] = None
+
+
+class CancelProjectResponse(BaseModel):
+    project_id: str
+    state: ConversationState
+    message: str
 
 
 class ActivityEvent(BaseModel):

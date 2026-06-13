@@ -1,19 +1,25 @@
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
 from ..models.schemas import (
     CreateProjectRequest, CreateProjectResponse,
     SendMessageRequest, SendMessageResponse,
+    CancelProjectResponse,
     ConversationState,
 )
 from ..agents.lead_agent import LeadAgent
 from ..llm import LLMClient
 from .. import database as db
+from .. import task_registry
+from ..errors import ProjectCancelled
 import asyncio
 import json
+import logging
 import os
 import zipfile
 import tempfile
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 router = APIRouter()
@@ -23,19 +29,31 @@ _llm = LLMClient()
 _lead = LeadAgent(_llm)
 
 
+async def _process_initial_brief(project_id: str, brief: str) -> None:
+    """Background task wrapper — logs failures instead of swallowing them."""
+    try:
+        await _lead.handle_message(project_id, brief)
+    except ProjectCancelled:
+        logger.info("Brief processing cancelled for project %s", project_id)
+    except Exception:
+        logger.exception(
+            "Background brief processing failed for project %s",
+            project_id,
+        )
+
+
 # ── Projects ──────────────────────────────────────
 
 @router.post("/projects", response_model=CreateProjectResponse)
-async def create_project(
-    request: CreateProjectRequest,
-    background_tasks: BackgroundTasks,
-):
+async def create_project(request: CreateProjectRequest):
     """Start a new project from a brief."""
     project = await _lead.start_project(request.brief)
 
-    # Process brief in background
-    background_tasks.add_task(
-        _lead.handle_message, project.id, request.brief
+    asyncio.create_task(
+        task_registry.run_project_task(
+            project.id,
+            _process_initial_brief(project.id, request.brief),
+        )
     )
 
     return CreateProjectResponse(
@@ -72,8 +90,65 @@ async def send_message(
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    response = await _lead.handle_message(project_id, request.message)
-    return response
+    if project.state == ConversationState.CANCELLED:
+        return SendMessageResponse(
+            message=(
+                "This project was stopped. "
+                "Start a new project from the home page."
+            ),
+            state=ConversationState.CANCELLED,
+            project=project,
+        )
+
+    if task_registry.is_task_running(project_id):
+        return SendMessageResponse(
+            message=(
+                "ForgeAI is still working on this project. "
+                "Use Stop if it seems stuck."
+            ),
+            state=project.state,
+            project=project,
+        )
+
+    return await _lead.handle_message(project_id, request.message)
+
+
+@router.post("/projects/{project_id}/cancel",
+             response_model=CancelProjectResponse)
+async def cancel_project(project_id: str):
+    """Stop a stuck or unwanted project."""
+    project = await db.load_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    message = await _lead.cancel_project(project_id)
+    project = await db.load_project(project_id)
+
+    return CancelProjectResponse(
+        project_id=project_id,
+        state=project.state if project else ConversationState.CANCELLED,
+        message=message,
+    )
+
+
+@router.delete("/projects/{project_id}")
+async def delete_project(project_id: str):
+    """Remove a project from the database."""
+    project = await db.load_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    task_registry.cancel_running_task(project_id)
+    await db.delete_project(project_id)
+
+    output_dir = Path(
+        os.environ.get("FORGEAI_OUTPUT_DIR", "output")
+    ) / project_id
+    if output_dir.exists():
+        import shutil
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+    return {"deleted": True, "project_id": project_id}
 
 
 @router.get("/projects/{project_id}/messages")

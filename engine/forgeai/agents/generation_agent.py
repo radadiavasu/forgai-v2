@@ -4,9 +4,15 @@ from ..models.schemas import (
 )
 from ..generation.file_manifest import ContentValidator
 from ..llm import LLMClient
+from ..utils.json_parse import parse_llm_json
 from pathlib import Path
 import json
+import logging
 import re
+
+logger = logging.getLogger(__name__)
+
+FRONTEND_BATCH_SIZE = 12
 
 
 FRONTEND_GENERATION_PROMPT = """You are a senior frontend developer.
@@ -23,8 +29,8 @@ Rules:
 8. React Router Links for all navigation — no <a> tags
 9. Show loading and error states for all API calls
 10. index.html must be in project root, not src/
-11. Vite proxy target is ALWAYS http://localhost:3001
-12. API base URL: import.meta.env.VITE_API_URL ?? 'http://localhost:3001/api'
+11. Vite dev server proxies /api to the backend
+12. API base URL: import.meta.env.VITE_API_URL ?? '/api'
 13. Field names must exactly match the data models provided
 14. API client must unwrap { data: [] } responses
     e.g. const tasks = response.data — not response directly
@@ -33,6 +39,10 @@ Rules:
     vite, @vitejs/plugin-react, tailwindcss, postcss, autoprefixer
 16. Do NOT generate main.jsx AND index.jsx — use main.jsx only
 17. src/main.jsx is the ONLY entry point
+18. Preview/demo seed data MUST live in src/data/previewSeed.json only.
+    Every page that needs fallback data must import:
+    import previewSeed from '../data/previewSeed.json'
+    Never use seedData.js or other filenames — one file, one name, all imports match.
 
 Output ONLY a JSON object. No explanation. No markdown.
 Format:
@@ -91,6 +101,45 @@ class GenerationAgent:
         self.llm = llm
         self.validator = ContentValidator()
 
+    def _filter_react_manifest(
+        self, files: list[ManifestFile]
+    ) -> list[ManifestFile]:
+        """Drop server-rendered template paths — ForgeAI preview uses React."""
+        filtered = []
+        for f in files:
+            path = f.path.replace("\\", "/")
+            if path.endswith(".ejs"):
+                continue
+            if path.startswith("views/"):
+                continue
+            if path.startswith("public/") and not path.endswith(".svg"):
+                continue
+            filtered.append(f)
+        return filtered
+
+    def _split_manifest_batches(
+        self, files: list[ManifestFile]
+    ) -> list[list[ManifestFile]]:
+        if len(files) <= FRONTEND_BATCH_SIZE:
+            return [files]
+
+        core: list[ManifestFile] = []
+        pages: list[ManifestFile] = []
+        for f in files:
+            path = f.path.replace("\\", "/")
+            if path.startswith("src/pages/") or (
+                path.startswith("src/components/")
+                and path != "src/components/Layout.jsx"
+            ):
+                pages.append(f)
+            else:
+                core.append(f)
+
+        batches = [core]
+        for i in range(0, len(pages), FRONTEND_BATCH_SIZE):
+            batches.append(pages[i:i + FRONTEND_BATCH_SIZE])
+        return [b for b in batches if b]
+
     async def generate_frontend(
         self,
         master: MasterDocument,
@@ -98,6 +147,7 @@ class GenerationAgent:
         manifest: FileManifest,
         output_dir: str,
         on_file_written=None,
+        change_request: str = "",
     ) -> list[GeneratedFile]:
         """
         Generate all frontend files in one LLM call.
@@ -115,21 +165,53 @@ class GenerationAgent:
         components_detail = "\n".join(
             f"  {c.name}:\n    {chr(10).join('    - ' + a for a in c.acceptance_criteria)}"
             for c in master.components
-            if "frontend" in c.name.lower() or "react" in c.name.lower()
         )
 
-        user_message = f"""Generate the complete frontend for this project.
+        manifest_files = self._filter_react_manifest(manifest.frontend_files)
+        batches = self._split_manifest_batches(manifest_files)
+        all_raw: list[dict] = []
+
+        change_block = ""
+        if change_request.strip():
+            change_block = f"""
+USER-REQUESTED CHANGE (must apply to the regenerated frontend):
+{change_request.strip()}
+
+Keep all existing features working. Apply the change above clearly.
+If the user asks for sample/dummy/seed data, add ONLY src/data/previewSeed.json
+(NOT .js, NOT seedData.js — JSON avoids syntax errors). Structure:
+{{ "posts": [{{ "id": 1, "title": "...", "cover_image": "https://..." }}] }}
+Use keys that match API resources (books, posts, tasks, etc.). For image URLs use
+stable public URLs (e.g. picsum.photos, covers.openlibrary.org). Every page that
+uses fallback data must import the exact same file:
+  import previewSeed from '../data/previewSeed.json'
+Use previewSeed as fallback when the API returns an empty list.
+Escape any double quotes inside JSON string values with backslash.
+"""
+
+        for batch_index, batch in enumerate(batches, start=1):
+            batch_list = "\n".join(
+                f"  - {f.path}: {f.purpose}" for f in batch
+            )
+            batch_note = ""
+            if len(batches) > 1:
+                batch_note = (
+                    f"\nThis is batch {batch_index} of frontend generation. "
+                    f"Generate ONLY these files:\n{batch_list}\n"
+                )
+
+            user_message = f"""Generate the complete frontend for this project.
 
 Project: {master.project_name}
 Summary: {master.project_summary}
 
 Tech Stack:
   Language: {tech_stack.language}
-  Framework: {tech_stack.framework}
+  Framework: React + Vite (SPA)
   Libraries: {', '.join(tech_stack.libraries)}
 
 Files to generate:
-{file_list}
+{batch_list if batch_note else file_list}
 
 Backend API endpoints your frontend must call:
 {endpoints}
@@ -138,19 +220,26 @@ Frontend requirements:
 {components_detail}
 
 API base URL: use import.meta.env.VITE_API_URL ?? '/api'
-
+{change_block}{batch_note}
 Generate every file listed above. Each file must be complete
-and production-ready."""
+and production-ready. React JSX pages only — no EJS templates."""
 
-        raw_files = await self._call_with_retry(
-            system_prompt=FRONTEND_GENERATION_PROMPT,
-            user_message=user_message,
-            manifest_files=manifest.frontend_files,
-            layer="frontend",
-        )
+            raw_batch = await self._call_with_retry(
+                system_prompt=FRONTEND_GENERATION_PROMPT,
+                user_message=user_message,
+                manifest_files=batch,
+                layer="frontend",
+            )
+            all_raw.extend(raw_batch)
+
+        if not all_raw:
+            logger.error(
+                "Frontend generation produced no parseable files for %s",
+                master.project_name,
+            )
 
         return await self._write_files(
-            raw_files, output_dir, "frontend", on_file_written
+            all_raw, output_dir, "frontend", on_file_written
         )
 
     async def generate_backend(
@@ -267,12 +356,19 @@ These field names must be identical in:
                 system_prompt=system_prompt,
                 user_message=user_message,
                 model="claude-sonnet-4-6",
-                max_tokens=16000,
+                max_tokens=32000,
             )
 
             files = self._parse_response(resp.content)
             if files:
                 return files
+
+            logger.warning(
+                "Generation parse failed on attempt %s/%s (%s files expected)",
+                attempt,
+                max_attempts,
+                len(manifest_files),
+            )
 
             if attempt < max_attempts:
                 user_message += (
@@ -287,17 +383,25 @@ These field names must be identical in:
         """Parse LLM response into list of file dicts."""
         raw = content.strip()
 
-        # Strip markdown fences
         if raw.startswith("```"):
             raw = re.sub(r"^```[a-z]*\n?", "", raw)
             raw = re.sub(r"\n?```$", "", raw.strip())
         raw = raw.strip()
 
         try:
+            data = parse_llm_json(raw)
+            files = data.get("files", [])
+            if isinstance(files, list) and files:
+                return files
+        except ValueError:
+            pass
+
+        try:
             data = json.loads(raw)
-            return data.get("files", [])
+            files = data.get("files", [])
+            if isinstance(files, list) and files:
+                return files
         except json.JSONDecodeError:
-            # Try to extract JSON object
             match = re.search(r'\{[\s\S]*\}', raw)
             if match:
                 try:
@@ -333,6 +437,10 @@ These field names must be identical in:
             if not self.validator.is_valid(path, content):
                 reason = self.validator.rejection_reason(path, content)
                 print(f"[GENERATION] Skipped {path}: {reason}")
+                stale = root / path
+                if stale.exists() and "previewseed" in path.lower():
+                    stale.unlink()
+                    print(f"[GENERATION] Removed stale seed file: {path}")
                 continue
 
             file_path = root / path

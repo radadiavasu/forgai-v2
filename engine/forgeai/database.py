@@ -100,6 +100,25 @@ async def list_projects() -> list[dict]:
         return [dict(r) for r in rows]
 
 
+async def delete_project(project_id: str) -> bool:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM activity_events WHERE project_id = $1",
+                project_id,
+            )
+            await conn.execute(
+                "DELETE FROM messages WHERE project_id = $1",
+                project_id,
+            )
+            result = await conn.execute(
+                "DELETE FROM projects WHERE id = $1",
+                project_id,
+            )
+            return result.endswith("1")
+
+
 async def save_message(
     project_id: str,
     role: str,

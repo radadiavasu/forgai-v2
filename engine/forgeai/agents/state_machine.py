@@ -9,6 +9,7 @@ TRANSITIONS = {
     ],
     ConversationState.RESEARCHING: [
         ConversationState.PLAN_APPROVAL,
+        ConversationState.WAITING_BRIEF,  # recover from failed planning
     ],
     ConversationState.PLAN_APPROVAL: [
         ConversationState.GENERATING_FRONTEND,
@@ -16,6 +17,7 @@ TRANSITIONS = {
     ],
     ConversationState.GENERATING_FRONTEND: [
         ConversationState.FRONTEND_APPROVAL,
+        ConversationState.PLAN_APPROVAL,  # recover from failed generation
     ],
     ConversationState.FRONTEND_APPROVAL: [
         ConversationState.GENERATING_BACKEND,
@@ -23,6 +25,7 @@ TRANSITIONS = {
     ],
     ConversationState.GENERATING_BACKEND: [
         ConversationState.COMPLETE,
+        ConversationState.FRONTEND_APPROVAL,  # recover from failed generation
     ],
     ConversationState.COMPLETE: [
         ConversationState.LIVE,

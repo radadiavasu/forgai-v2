@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { Link, useParams } from 'react-router-dom'
+import Editor from '@monaco-editor/react'
 import { api } from '../api/engine'
+import WebContainerPreview from '../components/WebContainerPreview'
+import FileTree from '../components/FileTree'
 
 function stateBadgeClass(state) {
   switch (state) {
@@ -16,9 +19,21 @@ function stateBadgeClass(state) {
     case 'COMPLETE':
     case 'LIVE':
       return 'bg-green-400'
+    case 'CANCELLED':
+      return 'bg-red-400'
     default:
       return 'bg-gray-400'
   }
+}
+
+function canStopProject(state) {
+  return [
+    'RESEARCHING',
+    'PLAN_APPROVAL',
+    'GENERATING_FRONTEND',
+    'FRONTEND_APPROVAL',
+    'GENERATING_BACKEND',
+  ].includes(state)
 }
 
 function formatTime(ts) {
@@ -30,27 +45,33 @@ function formatTime(ts) {
   }
 }
 
-function fileIcon(path) {
-  if (path.endsWith('.jsx') || path.endsWith('.js')) return '⚡'
-  if (path.endsWith('.css')) return '🎨'
-  if (path.endsWith('.json')) return '📦'
-  if (path.endsWith('.sql')) return '🗄'
-  if (path.endsWith('.html')) return '🌐'
-  if (path.endsWith('.yml') || path.endsWith('.yaml')) return '🐳'
-  return '📄'
+function getLanguage(path) {
+  if (!path) return 'plaintext'
+  if (path.endsWith('.jsx') || path.endsWith('.js')) return 'javascript'
+  if (path.endsWith('.ts') || path.endsWith('.tsx')) return 'typescript'
+  if (path.endsWith('.css')) return 'css'
+  if (path.endsWith('.html')) return 'html'
+  if (path.endsWith('.json')) return 'json'
+  if (path.endsWith('.sql')) return 'sql'
+  if (path.endsWith('.yml') || path.endsWith('.yaml')) return 'yaml'
+  if (path.endsWith('.md')) return 'markdown'
+  if (path.endsWith('.py')) return 'python'
+  return 'plaintext'
 }
 
 export default function ProjectPage() {
-  const { id } = useParams()
+  const { id: projectId } = useParams()
   const [project, setProject] = useState(null)
   const [activity, setActivity] = useState([])
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [thinking, setThinking] = useState(false)
-  const [tab, setTab] = useState('preview')
+  const [rightView, setRightView] = useState('code')
   const [files, setFiles] = useState([])
   const [selectedFile, setSelectedFile] = useState(null)
   const [gateInput, setGateInput] = useState('')
+  const [stopping, setStopping] = useState(false)
+  const [previewBannerDismissed, setPreviewBannerDismissed] = useState(false)
   const feedRef = useRef(null)
 
   const scrollFeed = useCallback(() => {
@@ -60,27 +81,40 @@ export default function ProjectPage() {
   }, [])
 
   const loadProject = useCallback(async () => {
-    const p = await api.getProject(id)
+    const p = await api.getProject(projectId)
     setProject(p)
     return p
-  }, [id])
+  }, [projectId])
 
   const loadFiles = useCallback(async () => {
-    const data = await api.getFiles(id)
+    const data = await api.getFiles(projectId)
     setFiles(data.files || [])
-  }, [id])
+  }, [projectId])
 
   const loadMessages = useCallback(async () => {
-    const msgs = await api.getMessages(id)
+    const msgs = await api.getMessages(projectId)
     setMessages(msgs.messages || [])
-  }, [id])
+  }, [projectId])
+
+  useEffect(() => {
+    setPreviewBannerDismissed(false)
+  }, [projectId])
+
+  useEffect(() => {
+    const fetchFiles = async () => {
+      const result = await api.getFiles(projectId)
+      setFiles(result.files || [])
+    }
+    fetchFiles()
+    const interval = setInterval(fetchFiles, 5000)
+    return () => clearInterval(interval)
+  }, [projectId])
 
   useEffect(() => {
     loadProject()
-    loadFiles()
     loadMessages()
 
-    const es = api.streamActivity(id, (event) => {
+    const es = api.streamActivity(projectId, (event) => {
       setActivity((prev) => {
         const key = `${event.type}-${event.message}-${event.timestamp}`
         if (prev.some((a) => `${a.type}-${a.message}-${a.timestamp}` === key)) {
@@ -92,7 +126,7 @@ export default function ProjectPage() {
 
     const poll = setInterval(async () => {
       const p = await loadProject()
-      const msgs = await api.getMessages(id)
+      const msgs = await api.getMessages(projectId)
       setMessages(msgs.messages || [])
       if (
         p?.state === 'GENERATING_FRONTEND' ||
@@ -108,7 +142,23 @@ export default function ProjectPage() {
       es.close()
       clearInterval(poll)
     }
-  }, [id, loadProject, loadFiles, loadMessages])
+  }, [projectId, loadProject, loadFiles, loadMessages])
+
+  useEffect(() => {
+    if (files.length === 0) return
+    if (!selectedFile || !files.some((f) => f.path === selectedFile.path)) {
+      setSelectedFile(files[0])
+    }
+  }, [files, selectedFile])
+
+  useEffect(() => {
+    if (
+      project?.state === 'FRONTEND_APPROVAL' ||
+      project?.state === 'COMPLETE'
+    ) {
+      setRightView('preview')
+    }
+  }, [project?.state])
 
   useEffect(scrollFeed, [activity, messages, scrollFeed])
 
@@ -118,7 +168,7 @@ export default function ProjectPage() {
     setInput('')
     setThinking(true)
     try {
-      const res = await api.sendMessage(id, msg)
+      const res = await api.sendMessage(projectId, msg)
       setProject(res.project || project)
       await loadMessages()
       await loadFiles()
@@ -132,17 +182,30 @@ export default function ProjectPage() {
     send(input)
   }
 
-  const state = project?.state
-  const showPreviewPlaceholder =
-    state === 'GENERATING_FRONTEND' ||
-    state === 'GENERATING_BACKEND' ||
-    state === 'RESEARCHING' ||
-    state === 'PLAN_APPROVAL'
-  const showFileTree =
-    state === 'FRONTEND_APPROVAL' ||
-    state === 'COMPLETE' ||
-    state === 'LIVE'
+  const stopProject = async () => {
+    if (stopping || !canStopProject(project?.state)) return
+    if (!window.confirm('Stop this project? You can start a new one from the home page.')) {
+      return
+    }
+    setStopping(true)
+    try {
+      const res = await api.cancelProject(projectId)
+      await loadProject()
+      await loadMessages()
+      setActivity((prev) => [
+        ...prev,
+        {
+          type: 'cancelled',
+          message: res.message || 'Project stopped',
+          timestamp: new Date().toISOString(),
+        },
+      ])
+    } finally {
+      setStopping(false)
+    }
+  }
 
+  const state = project?.state
   const fileCount = files.length
 
   return (
@@ -150,15 +213,27 @@ export default function ProjectPage() {
       <div className="flex flex-1 min-h-0">
         {/* Left panel */}
         <div className="w-[40%] border-r border-gray-800 flex flex-col min-h-0">
-          <div className="px-4 py-3 border-b border-gray-800">
-            <Link to="/" className="text-sm text-gray-500 hover:text-gray-300">
-              ← ForgeAI
-            </Link>
-            <h1 className="text-white font-semibold mt-1 truncate">
-              {project?.name || project?.brief?.slice(0, 40) || 'Loading...'}
-            </h1>
-            {state && (
-              <span className="text-xs text-gray-500">{state}</span>
+          <div className="px-4 py-3 border-b border-gray-800 flex items-start justify-between gap-2">
+            <div className="min-w-0">
+              <Link to="/" className="text-sm text-gray-500 hover:text-gray-300">
+                ← ForgeAI
+              </Link>
+              <h1 className="text-white font-semibold mt-1 truncate">
+                {project?.name || project?.brief?.slice(0, 40) || 'Loading...'}
+              </h1>
+              {state && (
+                <span className="text-xs text-gray-500">{state}</span>
+              )}
+            </div>
+            {canStopProject(state) && (
+              <button
+                type="button"
+                onClick={stopProject}
+                disabled={stopping}
+                className="shrink-0 text-xs px-3 py-1.5 rounded-lg border border-red-500/40 text-red-400 hover:bg-red-500/10 disabled:opacity-50"
+              >
+                {stopping ? 'Stopping...' : 'Stop'}
+              </button>
             )}
           </div>
 
@@ -186,10 +261,22 @@ export default function ProjectPage() {
             {activity.map((a, i) => (
               <div key={i} className="flex gap-2 items-start">
                 <span
-                  className={`mt-1.5 w-2 h-2 rounded-full shrink-0 ${stateBadgeClass(state)}`}
+                  className={`mt-1.5 w-2 h-2 rounded-full shrink-0 ${
+                    a.type === 'error' || a.type === 'cancelled'
+                      ? 'bg-red-500'
+                      : stateBadgeClass(state)
+                  }`}
                 />
                 <div>
-                  <p className="text-gray-300 text-sm">{a.message}</p>
+                  <p
+                    className={`text-sm ${
+                      a.type === 'error' || a.type === 'cancelled'
+                        ? 'text-red-400'
+                        : 'text-gray-300'
+                    }`}
+                  >
+                    {a.message}
+                  </p>
                   <p className="text-gray-500 text-xs">{formatTime(a.timestamp)}</p>
                 </div>
               </div>
@@ -199,6 +286,28 @@ export default function ProjectPage() {
               <p className="text-gray-500 text-sm italic">
                 ForgeAI is thinking...
               </p>
+            )}
+
+            {state === 'RESEARCHING' && !thinking && (
+              <div className="bg-gray-900 border border-yellow-500/30 rounded-xl p-4 mt-4">
+                <p className="text-yellow-400 font-medium">
+                  Planning your project...
+                </p>
+                <p className="text-gray-400 text-sm mt-1">
+                  This usually takes 1–3 minutes. Use Stop if it seems stuck.
+                </p>
+              </div>
+            )}
+
+            {state === 'CANCELLED' && (
+              <div className="bg-gray-900 border border-red-500/30 rounded-xl p-4 mt-4">
+                <p className="text-red-400 font-medium">Project stopped</p>
+                <p className="text-gray-400 text-sm mt-1">
+                  <Link to="/" className="text-blue-400 hover:text-blue-300">
+                    Start a new project →
+                  </Link>
+                </p>
+              </div>
             )}
 
             {state === 'FRONTEND_APPROVAL' && !thinking && (
@@ -247,7 +356,7 @@ export default function ProjectPage() {
                   {fileCount} files generated
                 </p>
                 <a
-                  href={api.downloadUrl(id)}
+                  href={api.downloadUrl(projectId)}
                   className="inline-block mt-3 bg-green-600 hover:bg-green-500 text-white px-4 py-2 rounded-lg text-sm font-medium"
                 >
                   Download Project
@@ -277,13 +386,18 @@ export default function ProjectPage() {
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="Message ForgeAI..."
+              placeholder={
+                state === 'CANCELLED'
+                  ? 'Project stopped — start a new one from home'
+                  : 'Message ForgeAI...'
+              }
               rows={2}
-              className="flex-1 bg-gray-900 border border-gray-700 rounded-xl text-white text-sm p-3 resize-none focus:outline-none focus:border-blue-500"
+              disabled={state === 'CANCELLED'}
+              className="flex-1 bg-gray-900 border border-gray-700 rounded-xl text-white text-sm p-3 resize-none focus:outline-none focus:border-blue-500 disabled:opacity-50"
             />
             <button
               type="submit"
-              disabled={!input.trim() || thinking}
+              disabled={!input.trim() || thinking || state === 'CANCELLED'}
               className="self-end bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 text-white px-4 py-2 rounded-xl text-sm font-medium"
             >
               Send
@@ -292,99 +406,131 @@ export default function ProjectPage() {
         </div>
 
         {/* Right panel */}
-        <div className="w-[60%] flex flex-col min-h-0">
-          <div className="flex border-b border-gray-800">
-            {['preview', 'files'].map((t) => (
+        <div className="w-[60%] flex flex-col min-h-0 bg-gray-950">
+          <div className="flex items-center justify-between px-4 py-2 bg-gray-900 border-b border-gray-800 gap-3">
+            <span className="text-gray-400 text-sm truncate min-w-0 flex-1">
+              {rightView === 'preview' ? (
+                <span className="text-gray-500">Live preview</span>
+              ) : selectedFile ? (
+                <>
+                  <span className="text-gray-500">{selectedFile.path.replace(/[^/]+$/, '')}</span>
+                  <span className="text-white font-medium">
+                    {selectedFile.path.split('/').pop()}
+                  </span>
+                </>
+              ) : (
+                'No file selected'
+              )}
+            </span>
+
+            {rightView === 'preview' && !previewBannerDismissed && (
+              <span className="hidden sm:inline-flex items-center gap-1.5 shrink-0 text-[11px] text-amber-200/90 bg-amber-500/10 border border-amber-500/25 rounded-full px-2.5 py-0.5">
+                Mock API · backend not running
+                <button
+                  type="button"
+                  onClick={() => setPreviewBannerDismissed(true)}
+                  className="text-amber-200/60 hover:text-amber-100 leading-none"
+                  title="Dismiss"
+                  aria-label="Dismiss preview notice"
+                >
+                  ×
+                </button>
+              </span>
+            )}
+
+            <div className="flex gap-1 shrink-0">
               <button
-                key={t}
                 type="button"
-                onClick={() => setTab(t)}
-                className={`px-6 py-3 text-sm font-medium capitalize ${
-                  tab === t
-                    ? 'text-white border-b-2 border-blue-500'
+                onClick={() => setRightView('preview')}
+                className={`p-1.5 rounded ${
+                  rightView === 'preview'
+                    ? 'bg-gray-700 text-white'
                     : 'text-gray-500 hover:text-gray-300'
                 }`}
+                title="Preview"
               >
-                {t === 'preview' ? 'Preview' : 'Files'}
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                >
+                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                  <circle cx="12" cy="12" r="3" />
+                </svg>
               </button>
-            ))}
+
+              <button
+                type="button"
+                onClick={() => setRightView('code')}
+                className={`p-1.5 rounded ${
+                  rightView === 'code'
+                    ? 'bg-gray-700 text-white'
+                    : 'text-gray-500 hover:text-gray-300'
+                }`}
+                title="Code"
+              >
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                >
+                  <polyline points="16 18 22 12 16 6" />
+                  <polyline points="8 6 2 12 8 18" />
+                </svg>
+              </button>
+            </div>
           </div>
 
           <div className="flex-1 overflow-hidden flex min-h-0">
-            {tab === 'preview' && (
-              <div className="flex-1 flex items-center justify-center p-8">
-                {showPreviewPlaceholder && (
-                  <p className="text-gray-500 text-center max-w-md">
-                    Frontend preview will appear here once generation is
-                    complete
-                  </p>
-                )}
-                {showFileTree && files.length === 0 && (
-                  <p className="text-gray-500">No files generated yet</p>
-                )}
-                {showFileTree && files.length > 0 && (
-                  <div className="w-full h-full overflow-auto p-4">
-                    <p className="text-gray-400 text-sm mb-4">
-                      File tree ({files.length} files) — switch to Files tab
-                      to view contents
-                    </p>
-                    <ul className="space-y-1 font-mono text-sm">
-                      {files.map((f) => (
-                        <li
-                          key={f.path}
-                          className="text-gray-300 flex gap-2"
-                        >
-                          <span>{fileIcon(f.path)}</span>
-                          <span>{f.path}</span>
-                          <span className="text-gray-600">
-                            ({f.bytes} bytes)
-                          </span>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-                {!showPreviewPlaceholder && !showFileTree && (
-                  <p className="text-gray-500">
-                    Waiting for generation to begin...
-                  </p>
-                )}
-              </div>
-            )}
+            <div
+              className={`flex-1 min-h-0 ${
+                rightView === 'preview' ? 'flex' : 'hidden'
+              }`}
+            >
+              <WebContainerPreview
+                files={files}
+                projectId={projectId}
+              />
+            </div>
 
-            {tab === 'files' && (
+            {rightView === 'code' && (
               <div className="flex flex-1 min-h-0">
-                <div className="w-1/3 border-r border-gray-800 overflow-y-auto">
-                  {files.length === 0 && (
-                    <p className="text-gray-500 text-sm p-4">
-                      No files yet
-                    </p>
-                  )}
-                  {files.map((f) => (
-                    <button
-                      key={f.path}
-                      type="button"
-                      onClick={() => setSelectedFile(f)}
-                      className={`w-full text-left px-3 py-2 text-sm flex gap-2 hover:bg-gray-900 ${
-                        selectedFile?.path === f.path
-                          ? 'bg-gray-900 text-white'
-                          : 'text-gray-400'
-                      }`}
-                    >
-                      <span>{fileIcon(f.path)}</span>
-                      <span className="truncate">{f.path}</span>
-                    </button>
-                  ))}
+                <div className="w-[260px] shrink-0 bg-[#0d1117] border-r border-gray-800 flex flex-col min-h-0 h-full">
+                  <FileTree
+                    files={files}
+                    selectedPath={selectedFile?.path}
+                    onSelectFile={setSelectedFile}
+                  />
                 </div>
-                <div className="flex-1 overflow-auto p-4">
+
+                <div className="flex-1 min-h-0">
                   {selectedFile ? (
-                    <pre className="text-gray-300 text-xs overflow-x-auto whitespace-pre-wrap font-mono">
-                      {selectedFile.content}
-                    </pre>
+                    <Editor
+                      height="100%"
+                      language={getLanguage(selectedFile?.path)}
+                      value={selectedFile?.content || ''}
+                      theme="vs-dark"
+                      options={{
+                        readOnly: true,
+                        minimap: { enabled: false },
+                        fontSize: 13,
+                        lineNumbers: 'on',
+                        scrollBeyondLastLine: false,
+                        wordWrap: 'on',
+                      }}
+                    />
                   ) : (
-                    <p className="text-gray-500 text-sm">
-                      Select a file to view its contents
-                    </p>
+                    <div className="flex items-center justify-center h-full">
+                      <p className="text-gray-500 text-sm">
+                        Select a file to view its contents
+                      </p>
+                    </div>
                   )}
                 </div>
               </div>

@@ -47,6 +47,22 @@ export const api = {
   downloadUrl: (projectId) =>
     `/api-engine/projects/${projectId}/download`,
 
+  cancelProject: async (projectId) => {
+    const r = await fetch(`/api-engine/projects/${projectId}/cancel`, {
+      method: 'POST',
+    })
+    if (!r.ok) throw new Error('Failed to stop project')
+    return r.json()
+  },
+
+  deleteProject: async (projectId) => {
+    const r = await fetch(`/api-engine/projects/${projectId}`, {
+      method: 'DELETE',
+    })
+    if (!r.ok) throw new Error('Failed to delete project')
+    return r.json()
+  },
+
   streamActivity: (projectId, onEvent) => {
     const es = new EventSource(
       `/api-engine/projects/${projectId}/stream`

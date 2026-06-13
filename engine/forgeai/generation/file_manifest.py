@@ -3,6 +3,9 @@ from ..models.schemas import (
 )
 from ..llm import LLMClient
 import json
+import os
+import subprocess
+import tempfile
 
 
 MANIFEST_PROMPT = """You are a software architect.
@@ -17,6 +20,8 @@ Rules:
 - Do not include files not needed by this specific project
 - Use the actual project requirements — do not invent extra pages
 - File paths must be relative to project root
+- Frontend is always a React SPA (Vite + JSX pages under src/pages/) — never EJS, Pug, or server-rendered templates
+- One src/pages/*.jsx file per user-facing screen
 
 Output ONLY a JSON object with this structure:
 {
@@ -52,20 +57,21 @@ class FileManifestGenerator:
             master, tech_stack
         )
 
-        # Step 2 — Add universal files deterministically
-        frontend_files = (
-            self._universal_frontend_files(tech_stack)
-            + project_files["frontend_files"]
+        frontend_files = self._deduplicate(
+            self._filter_react_frontend(
+                self._universal_frontend_files(tech_stack)
+                + project_files["frontend_files"]
+            )
         )
-        backend_files = (
+        backend_files = self._deduplicate(
             self._universal_backend_files(tech_stack)
             + project_files["backend_files"]
         )
         config_files = self._config_files(tech_stack)
 
         return FileManifest(
-            frontend_files=self._deduplicate(frontend_files),
-            backend_files=self._deduplicate(backend_files),
+            frontend_files=frontend_files,
+            backend_files=backend_files,
             config_files=config_files,
         )
 
@@ -300,6 +306,20 @@ List all project-specific files needed.""",
                 result.append(f)
         return result
 
+    def _filter_react_frontend(
+        self, files: list[ManifestFile]
+    ) -> list[ManifestFile]:
+        """Remove server-rendered template paths from the React manifest."""
+        filtered = []
+        for f in files:
+            path = f.path.replace("\\", "/")
+            if path.endswith(".ejs") or path.startswith("views/"):
+                continue
+            if path.startswith("public/"):
+                continue
+            filtered.append(f)
+        return filtered
+
 
 class ContentValidator:
     """
@@ -373,6 +393,8 @@ class ContentValidator:
             )
             if not has_code:
                 return False
+            if path.endswith(".js") and not self._js_syntax_valid(content):
+                return False
 
         if path.endswith(".py"):
             has_code = any(
@@ -434,4 +456,30 @@ class ContentValidator:
         if len(content.strip()) < min_bytes:
             return f"too short: {len(content.strip())} bytes, minimum {min_bytes}"
 
+        if path.endswith(".js") and not self._js_syntax_valid(content):
+            return "invalid JavaScript syntax (check unescaped quotes in strings)"
+
         return "failed code pattern check"
+
+    def _js_syntax_valid(self, content: str) -> bool:
+        """Run node --check when available to catch broken .js files."""
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".js",
+                delete=False,
+                encoding="utf-8",
+            ) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+            try:
+                result = subprocess.run(
+                    ["node", "--check", tmp_path],
+                    capture_output=True,
+                    timeout=10,
+                )
+                return result.returncode == 0
+            finally:
+                os.unlink(tmp_path)
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            return True

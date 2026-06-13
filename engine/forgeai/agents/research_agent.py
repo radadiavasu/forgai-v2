@@ -1,5 +1,6 @@
 from ..models.schemas import TechStack, MasterDocument, Component, DataModel, DataField, APIEndpoint
 from ..llm import LLMClient
+from ..utils.json_parse import parse_llm_json
 import json
 
 
@@ -51,6 +52,8 @@ Design rules:
 - Acceptance criteria must be specific and testable, not vague
 - Do not invent features the brief did not ask for
 - Do not omit features the brief clearly needs
+- Keep the design focused: at most 8 components, 5 data models, and 10 API endpoints
+- Frontend is a React SPA (Vite + React Router) — not server-rendered HTML templates
 
 Output a JSON object with these fields:
 - project_name: short descriptive name in kebab-case
@@ -94,11 +97,7 @@ Brief: {brief}{preference_note}""",
         )
 
         try:
-            raw = resp.content.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1]
-                raw = raw.rsplit("```", 1)[0]
-            data = json.loads(raw)
+            data = parse_llm_json(resp.content)
             tech_stack = TechStack(
                 language=data["language"],
                 framework=data["framework"],
@@ -150,26 +149,11 @@ Tech Stack: {tech_stack.language}, {tech_stack.framework},
 {tech_stack.database}
 Output the JSON object as specified.""",
             model="claude-sonnet-4-6",
-            max_tokens=8000,
+            max_tokens=16000,
         )
 
         try:
-            raw = resp.content.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1]
-                raw = raw.rsplit("```", 1)[0]
-
-            # Try direct parse first
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                # Try to find the largest valid JSON object
-                import re
-                match = re.search(r'\{[\s\S]*\}', raw)
-                if match:
-                    data = json.loads(match.group(0))
-                else:
-                    raise ValueError("No JSON found in response")
+            data = parse_llm_json(resp.content)
 
             components = [
                 Component(**c) for c in data.get("components", [])
